@@ -72,3 +72,59 @@ No existing frontend Socket.IO implementation or backend event contract was foun
 - Browser-level multi-tab manual testing remains the final deployment verification
 - Emoji reactions are supported for active players, bankrupt players, and spectators
 - Added 9-emoji allowlist, 1-second cooldown, reaction ID deduplication, and room-scoped broadcasts
+
+## Reconnection & Persistent Identity (this session)
+
+### Root cause fixed
+Players were identified by `socket.id`. On page refresh or brief disconnect a new socket ID was generated, the server could not match it to the existing player, and returned "You are not a member of this room."
+
+### Changes made
+
+**`backend/server.js`** (full rewrite)
+- Added `sessions` Map (`sessionId → { roomCode, socketId }`)
+- `createRoom` / `joinRoom` / `spectateRoom` now generate a 48-hex session token and return `sessionId` in the ack
+- `requirePlayer` now looks up by `player.socketId` (transport) not `player.id`
+- `emitGame` sends private state to `player.socketId`, not `player.id`
+- `handleDisconnect` replaced with grace-period logic: marks `connected=false`, schedules 2-minute cleanup, schedules 60-second turn auto-skip if it's the disconnected player's turn
+- Added `reconnectRoom` event: validates session token, cancels timers, restores socket binding, re-emits private game state
+- Host transfer delayed until grace period expires
+- Bankrupt players retain their session for spectating
+
+**`frontend/src/socket.js`**
+- Added `saveSession`, `loadSession`, `clearSession` localStorage helpers
+- Reconnection configured with exponential back-off (1s–8s, unlimited retries)
+
+**`frontend/src/App.jsx`**
+- `createRoom` / `joinRoom` call `saveSession` on success
+- `leaveRoom` calls `clearSession`
+- On `connect` event: auto-attempt `reconnectRoom` if a session exists in localStorage
+- Added `ReconnectingScreen` component shown during auto-reconnect
+- `playerDisconnected`: shows "reconnecting…" indicator, does NOT redirect to home
+- `playerReconnected`: shows success toast
+- `turnAutoSkipped`: shows toast with skipped player name
+- Disconnected opponents show amber pulsing "↻ Reconnecting…" label and dimmed avatar
+
+**`frontend/src/App.css`**
+- Added `.reconnecting-page`, `.reconnecting-panel`, `.spin-icon` for the reconnect screen
+- Added `.avatar-disconnected`, `.avatar-reconnecting-badge` for disconnected avatar state
+- Added `.reconnecting-tag`, `.disconnected-opponent`, `.reconnecting-label` for lobby/game indicators
+
+**`backend/server.reconnect.test.js`** (new)
+- 10 reconnection scenarios (see test file for details)
+
+**`backend/server.test.js`** (updated)
+- Assertions updated: `lobby.hostId` and `reaction.playerId` now equal `sessionId` (not `socket.id`)
+
+**`backend/package.json`**
+- Added `test:reconnect` script
+
+### Test results
+
+| File | Tests | Pass | Fail |
+|------|-------|------|------|
+| game.test.js + others (unit) | 29 | 29 | 0 |
+| server.test.js (socket integration) | 4 | 4 | 0 |
+| server.reconnect.test.js (new) | 10 | 10 | 0 |
+| **Total** | **43** | **43** | **0** |
+
+Frontend ESLint: 0 errors, 0 warnings.

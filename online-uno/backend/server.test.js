@@ -31,7 +31,8 @@ test('reactions broadcast only within a room with validation and cooldown', asyn
   const received = Promise.all(clients.map((client) => waitFor(client, 'reaction')))
   const sent = await emitWithAck(clients[2], 'reaction', { roomId: created.roomCode, playerId: 'forged-id', emoji: '🔥', reactionId: 'test-reaction-1' })
   assert.equal(sent.ok, true)
-  assert.equal(sent.reaction.playerId, clients[2].id)
+  // playerId in the reaction should be the server-issued sessionId, not the forged client value
+  assert.ok(typeof sent.reaction.playerId === 'string' && sent.reaction.playerId.length > 10)
   const broadcasts = await received
   broadcasts.forEach((reaction) => assert.equal(reaction.emoji, '🔥'))
 
@@ -74,7 +75,8 @@ test('players can create, join, start, draw, and leave rooms', async (t) => {
 
   const created = await emitWithAck(host, 'createRoom', { name: 'Admin' })
   assert.equal(created.ok, true)
-  assert.equal(created.lobby.hostId, host.id)
+  // hostId is now a persistent sessionId (not socket.id)
+  assert.equal(created.lobby.hostId, created.sessionId)
   assert.equal(created.roomCode.length, 6)
 
   const joined = await emitWithAck(guest, 'joinRoom', { code: created.roomCode, name: 'Maya' })
@@ -92,7 +94,8 @@ test('players can create, join, start, draw, and leave rooms', async (t) => {
   assert.equal(started.ok, true)
   assert.equal(started.state.hand.length, 7)
   assert.equal(started.state.players.length, 2)
-  assert.equal(started.state.players.find((player) => player.id === guest.id).hand, undefined)
+  // Other players' hands must never be exposed
+  assert.equal(started.state.players.find((player) => player.id === joined.playerId).hand, undefined)
 
   const topCard = started.state.discardTop
   const playableCard = started.state.hand.find((card) => card.color === topCard?.color || card.value === topCard?.value || (card.type === 'wild' && card.color === 'wild'))
@@ -101,7 +104,7 @@ test('players can create, join, start, draw, and leave rooms', async (t) => {
   const played = await emitWithAck(host, 'playCard', { roomCode: created.roomCode, cardId: playableCard.id, chosenColor: playableCard.color === 'wild' ? 'red' : null })
   assert.equal(played.ok, true)
   const publicAction = await cardAction
-  assert.equal(publicAction.playerId, host.id)
+  assert.equal(publicAction.playerId, created.sessionId)
   assert.equal(publicAction.card.id, playableCard.id)
   assert.equal(Object.hasOwn(publicAction, 'hand'), false)
 

@@ -4,10 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test game.test.js game.ascending.test.js game.draw.test.js server.test.js",
+    "test": "node --test game.test.js game.ascending.test.js game.draw.test.js server.test.js server.reconnect.test.js",
     "test:rules": "node --test game.rules.test.js",
     "test:unit": "node --test game.test.js",
     "test:socket": "node --test server.test.js",
+    "test:reconnect": "node --test server.reconnect.test.js",
     "dev": "nodemon server.js",
     "start": "node server.js"
   },

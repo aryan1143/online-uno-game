@@ -1754,3 +1754,96 @@ button {
     font-size: 36px;
   }
 }
+
+/* ============================================================
+   Reconnection styles
+   ============================================================ */
+
+/* Full-screen reconnecting overlay */
+.reconnecting-page {
+  min-height: 100svh;
+  background: var(--bg);
+  display: grid;
+  place-items: center;
+}
+.reconnecting-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  padding: 40px;
+  background: #20232a;
+  border: 1px solid #343740;
+  border-radius: 20px;
+  max-width: 380px;
+  width: calc(100% - 40px);
+  text-align: center;
+}
+.reconnecting-panel h1 {
+  font-family: "Arial Black", Impact, sans-serif;
+  font-size: 28px;
+  letter-spacing: -1px;
+  margin: 0;
+}
+.reconnecting-panel p {
+  color: #aeb3be;
+  margin: 0;
+  line-height: 1.5;
+}
+.reconnecting-spinner {
+  color: #f5c542;
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.spin-icon {
+  animation: spin 1.1s linear infinite;
+}
+
+/* Avatar — disconnected state */
+.avatar-disconnected {
+  opacity: 0.6;
+  border-color: #f04444 !important;
+}
+.avatar-reconnecting-badge {
+  position: absolute;
+  bottom: -4px;
+  right: -4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #f5c542;
+  color: #17191f;
+  font-size: 11px;
+  font-weight: 900;
+  display: grid;
+  place-items: center;
+  border: 2px solid #17191f;
+  animation: spin 1.4s linear infinite;
+  z-index: 10;
+}
+
+/* Lobby — reconnecting tag under player name */
+.reconnecting-tag {
+  font-size: 11px;
+  color: #f5c542;
+  font-weight: 700;
+}
+
+/* Opponent seat — disconnected */
+.disconnected-opponent {
+  opacity: 0.75;
+}
+.reconnecting-label {
+  color: #f5c542;
+  animation: pulse-opacity 1.4s ease-in-out infinite;
+}
+.disconnected-turn-label {
+  color: #f5c542 !important;
+}
+
+@keyframes pulse-opacity {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}

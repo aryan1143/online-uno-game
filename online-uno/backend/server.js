@@ -13,7 +13,24 @@ import { getPlayableCardIds } from './game/gameLogic.js'
 
 export const rooms = new Map()
 
+// sessionId → { roomCode, socketId }
+// Allows reverse-lookup from a persistent session token to the current socket.
+export const sessions = new Map()
+
+// sessionId → NodeJS.Timeout — pending cleanup timers for disconnected players
+const disconnectTimers = new Map()
+
+// sessionId → NodeJS.Timeout — pending auto-skip timers for disconnected current-turn players
+const turnSkipTimers = new Map()
+
+// Grace period before removing a disconnected player (2 minutes)
+const GRACE_PERIOD_MS = 2 * 60 * 1000
+
+// Auto-skip a disconnected player's turn after 60 seconds
+const TURN_SKIP_DELAY_MS = 60 * 1000
+
 export const REACTION_EMOJIS = Object.freeze(['😂', '😭', '🔥', '😎', '👏', '😡', '🤯', '❤️', '💀'])
+// Keyed by sessionId
 const reactionCooldowns = new Map()
 const recentReactionIds = new Map()
 
@@ -34,10 +51,18 @@ function uniqueRoomCode() {
   return code
 }
 
+function generateSessionId() {
+  return randomBytes(24).toString('hex')
+}
+
 function cleanName(value) {
   if (typeof value !== 'string') return ''
   return value.trim().replace(/\s+/g, ' ').slice(0, 16)
 }
+
+// ---------------------------------------------------------------------------
+// Public state builders
+// ---------------------------------------------------------------------------
 
 function publicLobby(room) {
   return {
@@ -140,12 +165,190 @@ function emitLobby(io, room) {
   io.to(room.code).emit('room:update', publicLobby(room))
 }
 
+// Send each player their own private game state via their current socketId
 function emitGame(io, room) {
   for (const player of room.players) {
-    io.to(player.id).emit('gameState', getPrivateGameState(room, player.id))
-    io.to(player.id).emit('game:state', getPrivateGameState(room, player.id))
+    if (player.socketId) {
+      const state = getPrivateGameState(room, player.id)
+      io.to(player.socketId).emit('gameState', state)
+      io.to(player.socketId).emit('game:state', state)
+    }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Session helpers
+// ---------------------------------------------------------------------------
+
+function sessionForSocket(socket) {
+  return socket.data.sessionId || null
+}
+
+function roomForSessionId(sessionId) {
+  const entry = sessions.get(sessionId)
+  if (!entry) return null
+  return rooms.get(entry.roomCode) || null
+}
+
+function playerBySessionId(room, sessionId) {
+  return room.players.find((p) => p.id === sessionId) || null
+}
+
+function playerBySocketId(room, socketId) {
+  return room.players.find((p) => p.socketId === socketId) || null
+}
+
+// ---------------------------------------------------------------------------
+// Disconnect / cleanup logic
+// ---------------------------------------------------------------------------
+
+function cancelDisconnectTimer(sessionId) {
+  const timer = disconnectTimers.get(sessionId)
+  if (timer) { clearTimeout(timer); disconnectTimers.delete(sessionId) }
+}
+
+function cancelTurnSkipTimer(sessionId) {
+  const timer = turnSkipTimers.get(sessionId)
+  if (timer) { clearTimeout(timer); turnSkipTimers.delete(sessionId) }
+}
+
+/**
+ * Permanently remove a player from their room after the grace period expires.
+ * Bankrupt players (isSpectator after bankruptcy) are cleared too.
+ */
+function cleanupPlayer(io, roomCode, sessionId, gameManager) {
+  disconnectTimers.delete(sessionId)
+  cancelTurnSkipTimer(sessionId)
+
+  const room = rooms.get(roomCode)
+  if (!room) { sessions.delete(sessionId); return }
+
+  const index = room.players.findIndex((p) => p.id === sessionId)
+  if (index === -1) { sessions.delete(sessionId); return }
+
+  const player = room.players[index]
+  room.players.splice(index, 1)
+
+  // Remove from game players array if game is in progress
+  if (room.game?.players) {
+    const gameIndex = room.game.players.findIndex((p) => p.id === sessionId)
+    if (gameIndex !== -1) room.game.players.splice(gameIndex, 1)
+  }
+
+  sessions.delete(sessionId)
+  reactionCooldowns.delete(sessionId)
+  recentReactionIds.delete(sessionId)
+
+  if (room.players.length === 0) {
+    rooms.delete(roomCode)
+    gameManager.removeGame(roomCode)
+    return
+  }
+
+  // Transfer host only now that the grace period has expired
+  if (room.hostId === sessionId) {
+    const nextHost = room.players.find((p) => !p.isSpectator)
+    if (nextHost) room.hostId = nextHost.id
+  }
+
+  if (room.game) {
+    if (room.game.players.length < 2) {
+      room.game.status = 'finished'
+      room.game.winner = room.game.players[0] || null
+      room.game.currentPlayerIndex = 0
+      io.to(roomCode).emit('gameEnded', { winner: room.game.winner ? { id: room.game.winner.id, name: room.game.winner.name } : null, state: publicGameState(room) })
+      gameManager.removeGame(roomCode)
+      room.game = null
+      room.status = 'lobby'
+    } else {
+      // Clamp currentPlayerIndex in case it went out of range
+      if (room.game.currentPlayerIndex >= room.game.players.length) {
+        room.game.currentPlayerIndex = 0
+      }
+      emitGame(io, room)
+    }
+  }
+
+  emitLobby(io, room)
+  io.to(roomCode).emit('playerLeft', { playerId: sessionId, name: player.name, roomCode })
+}
+
+/**
+ * Handle a socket disconnect event: start the grace period, mark player offline.
+ * Does NOT remove the player immediately.
+ */
+function handleDisconnect(io, socket, gameManager) {
+  const sessionId = sessionForSocket(socket)
+  if (!sessionId) return
+
+  // Update sessions Map — socket is gone
+  const entry = sessions.get(sessionId)
+  if (entry) entry.socketId = null
+
+  const roomCode = socket.data.roomCode
+  if (!roomCode) { sessions.delete(sessionId); return }
+
+  const room = rooms.get(roomCode)
+  if (!room) { sessions.delete(sessionId); return }
+
+  const player = playerBySessionId(room, sessionId)
+  if (!player) return
+
+  player.connected = false
+  player.socketId = null
+
+  // Cancel any existing timer (shouldn't happen but be safe)
+  cancelDisconnectTimer(sessionId)
+  cancelTurnSkipTimer(sessionId)
+
+  // Notify others
+  emitLobby(io, room)
+  io.to(roomCode).emit('playerDisconnected', {
+    playerId: sessionId,
+    name: player.name,
+    roomCode,
+    reconnecting: true,
+  })
+
+  // Schedule turn auto-skip if this player holds the current turn
+  if (room.game && room.game.status === 'playing') {
+    const currentPlayer = room.game.players[room.game.currentPlayerIndex]
+    if (currentPlayer?.id === sessionId) {
+      const skipTimer = setTimeout(() => {
+        turnSkipTimers.delete(sessionId)
+        const r = rooms.get(roomCode)
+        if (!r?.game || r.game.status !== 'playing') return
+        const cp = r.game.players[r.game.currentPlayerIndex]
+        if (!cp || cp.id !== sessionId) return
+        // Advance to the next player
+        const count = r.game.players.length
+        r.game.currentPlayerIndex = (r.game.currentPlayerIndex + r.game.direction + count * 100) % count
+        r.game.turnDrawn = false
+        r.game.actionSequence += 1
+        r.game.lastAction = {
+          actionId: `${roomCode}-${r.game.actionSequence}-autoskip`,
+          playerId: sessionId,
+          type: 'autoskip',
+          timestamp: Date.now(),
+          sequence: r.game.actionSequence,
+        }
+        io.to(roomCode).emit('turnAutoSkipped', { playerId: sessionId, name: player.name })
+        emitGame(io, r)
+      }, TURN_SKIP_DELAY_MS)
+      turnSkipTimers.set(sessionId, skipTimer)
+    }
+  }
+
+  // Schedule permanent cleanup after grace period
+  const cleanupTimer = setTimeout(() => {
+    cleanupPlayer(io, roomCode, sessionId, gameManager)
+  }, GRACE_PERIOD_MS)
+  disconnectTimers.set(sessionId, cleanupTimer)
+}
+
+// ---------------------------------------------------------------------------
+// Server factory
+// ---------------------------------------------------------------------------
 
 export function createUnoServer() {
   const app = express()
@@ -186,7 +389,7 @@ export function createUnoServer() {
   }
 
   function requirePlayer(socket, room, callback) {
-    const player = room.players.find((entry) => entry.id === socket.id)
+    const player = playerBySocketId(room, socket.id)
     if (!player) {
       error(socket, callback, 'NOT_IN_ROOM', 'You are not a player in this room')
       return null
@@ -204,65 +407,45 @@ export function createUnoServer() {
     return player
   }
 
-  function handleDisconnect(socket) {
-    for (const [code, room] of rooms) {
-      const index = room.players.findIndex((player) => player.id === socket.id)
-      if (index === -1) continue
-
-      room.players.splice(index, 1)
-      if (room.game?.players) {
-        const gameIndex = room.game.players.findIndex((player) => player.id === socket.id)
-        if (gameIndex !== -1) room.game.players.splice(gameIndex, 1)
-      }
-
-      if (room.players.length === 0) {
-        rooms.delete(code)
-        gameManager.removeGame(code)
-      } else {
-        if (room.hostId === socket.id) room.hostId = room.players[0].id
-        room.status = 'lobby'
-
-        if (room.game) {
-          room.game.status = room.game.players.length >= 2 ? 'waiting' : 'finished'
-          room.game.currentPlayerIndex = 0
-          if (room.game.players.length < 2) room.game.winner = null
-          gameManager.removeGame(code)
-          room.game = null
-        }
-
-        emitLobby(io, room)
-        if (room.game) emitGame(io, room)
-        io.to(code).emit('playerDisconnected', { playerId: socket.id, roomCode: code })
-      }
-      break
-    }
+  function roomForSocket(socket) {
+    return socket.data.roomCode || [...rooms.values()].some((room) => playerBySocketId(room, socket.id))
   }
 
+  // ---------------------------------------------------------------------------
+  // Socket event handlers
+  // ---------------------------------------------------------------------------
+
   io.on('connection', (socket) => {
+
+    // ----- createRoom --------------------------------------------------------
     socket.on('createRoom', (payload = {}, callback) => {
       const name = cleanName(payload.name)
       if (!name) return error(socket, callback, 'INVALID_NAME', 'Player name is required')
       if (roomForSocket(socket)) return error(socket, callback, 'ALREADY_IN_ROOM', 'Leave the current room first')
 
       const code = uniqueRoomCode()
+      const sessionId = generateSessionId()
+
       const room = {
         code,
-        hostId: socket.id,
+        hostId: sessionId,
         status: 'lobby',
-        players: [{ id: socket.id, name, connected: true }],
+        players: [{ id: sessionId, socketId: socket.id, name, connected: true, isSpectator: false }],
         game: null,
       }
       rooms.set(code, room)
+      sessions.set(sessionId, { roomCode: code, socketId: socket.id })
       socket.join(code)
       socket.data.roomCode = code
-      socket.data.playerId = socket.id
+      socket.data.sessionId = sessionId
 
-      const result = { ok: true, roomCode: code, playerId: socket.id, lobby: publicLobby(room) }
+      const result = { ok: true, roomCode: code, playerId: sessionId, sessionId, lobby: publicLobby(room) }
       ack(callback, result)
       socket.emit('roomCreated', result)
       emitLobby(io, room)
     })
 
+    // ----- joinRoom ----------------------------------------------------------
     socket.on('joinRoom', (payload = {}, callback) => {
       const code = String(payload.code || payload.roomCode || '').trim().toUpperCase()
       const name = cleanName(payload.name)
@@ -277,17 +460,20 @@ export function createUnoServer() {
         return error(socket, callback, 'DUPLICATE_PLAYER', 'A player with that name is already in the room')
       }
 
-      room.players.push({ id: socket.id, name, connected: true })
+      const sessionId = generateSessionId()
+      room.players.push({ id: sessionId, socketId: socket.id, name, connected: true, isSpectator: false })
+      sessions.set(sessionId, { roomCode: code, socketId: socket.id })
       socket.join(code)
       socket.data.roomCode = code
-      socket.data.playerId = socket.id
+      socket.data.sessionId = sessionId
 
-      const result = { ok: true, roomCode: code, playerId: socket.id, lobby: publicLobby(room) }
+      const result = { ok: true, roomCode: code, playerId: sessionId, sessionId, lobby: publicLobby(room) }
       ack(callback, result)
       socket.emit('roomJoined', result)
       emitLobby(io, room)
     })
 
+    // ----- spectateRoom ------------------------------------------------------
     socket.on('spectateRoom', (payload = {}, callback) => {
       const code = String(payload.code || payload.roomId || payload.roomCode || '').trim().toUpperCase()
       const name = cleanName(payload.name)
@@ -298,101 +484,219 @@ export function createUnoServer() {
       if (room.players.length >= 4 && room.status === 'lobby') return error(socket, callback, 'ROOM_FULL', 'This room is full')
       if (room.players.some((player) => player.name.toLowerCase() === name.toLowerCase())) return error(socket, callback, 'DUPLICATE_PLAYER', 'A player with that name is already in the room')
 
-      room.players.push({ id: socket.id, name, connected: true, isSpectator: true })
+      const sessionId = generateSessionId()
+      room.players.push({ id: sessionId, socketId: socket.id, name, connected: true, isSpectator: true })
+      sessions.set(sessionId, { roomCode: code, socketId: socket.id })
       socket.join(code)
       socket.data.roomCode = code
-      socket.data.playerId = socket.id
-      const result = { ok: true, roomCode: code, playerId: socket.id, spectator: true, lobby: publicLobby(room) }
+      socket.data.sessionId = sessionId
+
+      const result = { ok: true, roomCode: code, playerId: sessionId, sessionId, spectator: true, lobby: publicLobby(room) }
       ack(callback, result)
       socket.emit('spectatorJoined', result)
       emitLobby(io, room)
     })
 
+    // ----- reconnectRoom -----------------------------------------------------
+    socket.on('reconnectRoom', (payload = {}, callback) => {
+      const sessionId = String(payload.sessionId || payload.playerId || '').trim()
+      const roomCode = String(payload.roomCode || '').trim().toUpperCase()
+
+      if (!sessionId || !roomCode) return error(socket, callback, 'INVALID_PAYLOAD', 'sessionId and roomCode are required')
+
+      // Validate session exists and belongs to that room
+      const sessionEntry = sessions.get(sessionId)
+      if (!sessionEntry || sessionEntry.roomCode !== roomCode) {
+        return error(socket, callback, 'SESSION_EXPIRED', 'Session not found or has expired')
+      }
+
+      const room = rooms.get(roomCode)
+      if (!room) return error(socket, callback, 'ROOM_NOT_FOUND', 'Room no longer exists')
+
+      const player = playerBySessionId(room, sessionId)
+      if (!player) return error(socket, callback, 'SESSION_EXPIRED', 'Player no longer in room')
+
+      // If another socket is already using this session (double-tab edge case), reject
+      if (player.socketId && player.socketId !== socket.id) {
+        const existingSocket = io.sockets.sockets.get(player.socketId)
+        if (existingSocket && existingSocket.connected) {
+          return error(socket, callback, 'ALREADY_CONNECTED', 'Session is already connected')
+        }
+      }
+
+      // Cancel any pending cleanup / turn-skip timers
+      cancelDisconnectTimer(sessionId)
+      cancelTurnSkipTimer(sessionId)
+
+      // Restore the session
+      player.socketId = socket.id
+      player.connected = true
+      sessionEntry.socketId = socket.id
+
+      socket.join(roomCode)
+      socket.data.roomCode = roomCode
+      socket.data.sessionId = sessionId
+
+      // Notify others
+      emitLobby(io, room)
+      io.to(roomCode).emit('playerReconnected', { playerId: sessionId, name: player.name })
+
+      // Send private game state back to this socket
+      const state = room.game ? getPrivateGameState(room, sessionId) : null
+
+      const result = {
+        ok: true,
+        roomCode,
+        playerId: sessionId,
+        sessionId,
+        lobby: publicLobby(room),
+        state,
+        gameStatus: room.status,
+      }
+      ack(callback, result)
+    })
+
+    // ----- leaveRoom ---------------------------------------------------------
     socket.on('leaveRoom', (payload = {}, callback) => {
       const code = String(payload.roomCode || payload.code || socket.data.roomCode || '').trim().toUpperCase()
       if (!code) return error(socket, callback, 'NOT_IN_ROOM', 'You are not in a room')
-      reactionCooldowns.delete(socket.id)
-      recentReactionIds.delete(socket.id)
-      handleDisconnect(socket)
+
+      const sessionId = sessionForSocket(socket)
+
+      reactionCooldowns.delete(sessionId)
+      recentReactionIds.delete(sessionId)
+      cancelDisconnectTimer(sessionId)
+      cancelTurnSkipTimer(sessionId)
+
+      // Explicit leave — remove immediately (no grace period)
+      const room = rooms.get(code)
+      if (room) {
+        const index = room.players.findIndex((p) => p.id === sessionId)
+        if (index !== -1) {
+          room.players.splice(index, 1)
+          if (room.game?.players) {
+            const gi = room.game.players.findIndex((p) => p.id === sessionId)
+            if (gi !== -1) room.game.players.splice(gi, 1)
+          }
+
+          if (room.players.length === 0) {
+            rooms.delete(code)
+            gameManager.removeGame(code)
+          } else {
+            if (room.hostId === sessionId) {
+              const next = room.players.find((p) => !p.isSpectator)
+              if (next) room.hostId = next.id
+            }
+            if (room.game) {
+              if (room.game.players.length < 2) {
+                room.game.status = 'finished'
+                room.game.winner = room.game.players[0] || null
+                io.to(code).emit('gameEnded', { winner: room.game.winner ? { id: room.game.winner.id, name: room.game.winner.name } : null, state: publicGameState(room) })
+                gameManager.removeGame(code)
+                room.game = null
+                room.status = 'lobby'
+              } else {
+                if (room.game.currentPlayerIndex >= room.game.players.length) room.game.currentPlayerIndex = 0
+                emitGame(io, room)
+              }
+            }
+            emitLobby(io, room)
+            io.to(code).emit('playerDisconnected', { playerId: sessionId, roomCode: code })
+          }
+        }
+      }
+
+      if (sessionId) sessions.delete(sessionId)
       ack(callback, { ok: true, roomCode: code })
       socket.leave(code)
       socket.data.roomCode = undefined
+      socket.data.sessionId = undefined
     })
 
+    // ----- startGame ---------------------------------------------------------
     socket.on('startGame', (payload = {}, callback) => {
       const code = String(payload.roomCode || payload.code || socket.data.roomCode || '').trim().toUpperCase()
       const room = requireRoom(socket, code, callback)
       if (!room) return
       if (!requireHost(socket, room, callback)) return
       if (room.status !== 'lobby') return error(socket, callback, 'GAME_ALREADY_STARTED', 'The game has already started')
-      if (room.players.length < 2) return error(socket, callback, 'NOT_ENOUGH_PLAYERS', 'At least 2 players are required')
+      const activePlayers = room.players.filter((p) => !p.isSpectator)
+      if (activePlayers.length < 2) return error(socket, callback, 'NOT_ENOUGH_PLAYERS', 'At least 2 players are required')
 
       try {
-        room.game = gameManager.createGame(code, room.players.map((player) => ({ id: player.id, name: player.name })))
+        room.game = gameManager.createGame(code, activePlayers.map((p) => ({ id: p.id, name: p.name })))
         room.status = 'playing'
         emitLobby(io, room)
         emitGame(io, room)
-        ack(callback, { ok: true, roomCode: code, state: getPrivateGameState(room, socket.id) })
+        const hostSessionId = socket.data.sessionId
+        ack(callback, { ok: true, roomCode: code, state: getPrivateGameState(room, hostSessionId) })
         io.to(code).emit('gameStarted', publicGameState(room))
       } catch (caught) {
         error(socket, callback, caught.code || 'START_FAILED', caught.message)
       }
     })
 
+    // ----- playCard ----------------------------------------------------------
     socket.on('playCard', (payload = {}, callback) => {
       const code = String(payload.roomCode || payload.code || socket.data.roomCode || '').trim().toUpperCase()
       const room = requireRoom(socket, code, callback)
       if (!room) return
-      requirePlayer(socket, room, callback)
+      const player = requirePlayer(socket, room, callback)
+      if (!player) return
       if (!room.game) return error(socket, callback, 'GAME_NOT_STARTED', 'The game has not started')
 
       try {
-        const result = gameManager.playCard(code, socket.id, payload.cardId, payload.chosenColor)
+        const result = gameManager.playCard(code, player.id, payload.cardId, payload.chosenColor)
         emitGame(io, room)
-        emitCardAction(io, room, result, socket.id)
+        emitCardAction(io, room, result, player.id)
         if (result.action === 'win') io.to(code).emit('gameEnded', { winner: result.winner, state: publicGameState(room) })
-        ack(callback, { ok: true, action: result.action, state: getPrivateGameState(room, socket.id) })
+        ack(callback, { ok: true, action: result.action, state: getPrivateGameState(room, player.id) })
       } catch (caught) {
         error(socket, callback, caught.code || 'INVALID_MOVE', caught.message)
       }
     })
 
+    // ----- chooseWildColor ---------------------------------------------------
     socket.on('chooseWildColor', (payload = {}, callback) => {
       const code = String(payload.roomCode || payload.code || socket.data.roomCode || '').trim().toUpperCase()
       const room = requireRoom(socket, code, callback)
       if (!room) return
-      requirePlayer(socket, room, callback)
+      const player = requirePlayer(socket, room, callback)
+      if (!player) return
       if (!room.game) return error(socket, callback, 'GAME_NOT_STARTED', 'The game has not started')
 
       if (!payload.cardId) return error(socket, callback, 'CARD_REQUIRED', 'cardId is required')
       try {
-        const result = gameManager.playCard(code, socket.id, payload.cardId, payload.color || payload.chosenColor)
+        const result = gameManager.playCard(code, player.id, payload.cardId, payload.color || payload.chosenColor)
         emitGame(io, room)
-        emitCardAction(io, room, result, socket.id)
+        emitCardAction(io, room, result, player.id)
         if (result.action === 'win') io.to(code).emit('gameEnded', { winner: result.winner, state: publicGameState(room) })
-        ack(callback, { ok: true, action: result.action, state: getPrivateGameState(room, socket.id) })
+        ack(callback, { ok: true, action: result.action, state: getPrivateGameState(room, player.id) })
       } catch (caught) {
         error(socket, callback, caught.code || 'INVALID_MOVE', caught.message)
       }
     })
 
+    // ----- drawCard ----------------------------------------------------------
     socket.on('drawCard', (payload = {}, callback) => {
       const code = String(payload.roomCode || payload.code || socket.data.roomCode || '').trim().toUpperCase()
       const room = requireRoom(socket, code, callback)
       if (!room) return
-      requirePlayer(socket, room, callback)
+      const player = requirePlayer(socket, room, callback)
+      if (!player) return
       if (!room.game) return error(socket, callback, 'GAME_NOT_STARTED', 'The game has not started')
 
       try {
-        const result = gameManager.drawCard(code, socket.id)
+        const result = gameManager.drawCard(code, player.id)
         emitGame(io, room)
-        emitDrawAction(io, room, result, socket.id)
-        ack(callback, { ok: true, action: 'draw', drawnCard: result.drawnCard, state: getPrivateGameState(room, socket.id) })
+        emitDrawAction(io, room, result, player.id)
+        ack(callback, { ok: true, action: 'draw', drawnCard: result.drawnCard, state: getPrivateGameState(room, player.id) })
       } catch (caught) {
         error(socket, callback, caught.code || 'INVALID_MOVE', caught.message)
       }
     })
 
+    // ----- endGame -----------------------------------------------------------
     socket.on('endGame', (payload = {}, callback) => {
       const code = String(payload.roomCode || payload.code || socket.data.roomCode || '').trim().toUpperCase()
       const room = requireRoom(socket, code, callback)
@@ -406,6 +710,7 @@ export function createUnoServer() {
       ack(callback, { ok: true, roomCode: code })
     })
 
+    // ----- returnToLobby -----------------------------------------------------
     socket.on('returnToLobby', (payload = {}, callback) => {
       const code = String(payload.roomCode || payload.code || socket.data.roomCode || '').trim().toUpperCase()
       const room = requireRoom(socket, code, callback)
@@ -420,6 +725,7 @@ export function createUnoServer() {
       io.to(code).emit('gameRestarted', publicLobby(room))
     })
 
+    // ----- restartGame -------------------------------------------------------
     socket.on('restartGame', (payload = {}, callback) => {
       const code = String(payload.roomCode || payload.code || socket.data.roomCode || '').trim().toUpperCase()
       const room = requireRoom(socket, code, callback)
@@ -434,13 +740,16 @@ export function createUnoServer() {
       io.to(code).emit('gameRestarted', publicLobby(room))
     })
 
+    // ----- reaction ----------------------------------------------------------
     socket.on('reaction', (payload = {}, callback) => {
       const code = String(payload.roomId || payload.roomCode || payload.code || socket.data.roomCode || '').trim().toUpperCase()
       const room = requireRoom(socket, code, callback)
       if (!room) return
 
-      const member = room.players.find((player) => player.id === socket.id)
+      const member = playerBySocketId(room, socket.id)
       if (!member) return error(socket, callback, 'NOT_IN_ROOM', 'You are not a member of this room')
+
+      const sessionId = member.id
 
       const emoji = String(payload.emoji || '')
       if (!REACTION_EMOJIS.includes(emoji)) return error(socket, callback, 'INVALID_REACTION', 'Unsupported reaction emoji')
@@ -449,35 +758,30 @@ export function createUnoServer() {
 
       const reactionId = typeof payload.reactionId === 'string' && payload.reactionId.slice(0, 80)
         ? payload.reactionId.slice(0, 80)
-        : `${socket.id}-${now}-${Math.random().toString(36).slice(2, 8)}`
-      const seenIds = recentReactionIds.get(socket.id) || new Set()
+        : `${sessionId}-${now}-${Math.random().toString(36).slice(2, 8)}`
+      const seenIds = recentReactionIds.get(sessionId) || new Set()
       if (seenIds.has(reactionId)) return ack(callback, { ok: true, duplicate: true })
       seenIds.add(reactionId)
       if (seenIds.size > 100) seenIds.clear()
-      recentReactionIds.set(socket.id, seenIds)
+      recentReactionIds.set(sessionId, seenIds)
 
-      const cooldownUntil = reactionCooldowns.get(socket.id) || 0
+      const cooldownUntil = reactionCooldowns.get(sessionId) || 0
       if (now < cooldownUntil) return error(socket, callback, 'REACTION_COOLDOWN', 'Please wait before sending another reaction')
 
-      reactionCooldowns.set(socket.id, now + 1000)
-      const reaction = { roomId: code, playerId: socket.id, emoji, reactionId, timestamp: now }
+      reactionCooldowns.set(sessionId, now + 1000)
+      const reaction = { roomId: code, playerId: sessionId, emoji, reactionId, timestamp: now }
       io.to(code).emit('reaction', reaction)
       io.to(code).emit('reactionReceived', reaction)
       ack(callback, { ok: true, reaction })
     })
 
+    // ----- disconnect --------------------------------------------------------
     socket.on('disconnect', () => {
-      reactionCooldowns.delete(socket.id)
-      recentReactionIds.delete(socket.id)
-      handleDisconnect(socket)
+      handleDisconnect(io, socket, gameManager)
     })
   })
 
-  function roomForSocket(socket) {
-    return socket.data.roomCode || [...rooms.values()].some((room) => room.players.some((player) => player.id === socket.id))
-  }
-
-  return { app, httpServer, io, rooms, gameManager }
+  return { app, httpServer, io, rooms, sessions, gameManager }
 }
 
 const entryFile = process.argv[1] ? pathToFileURL(process.argv[1]).href : ''

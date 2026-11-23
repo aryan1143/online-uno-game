@@ -71,13 +71,36 @@ No frontend sample opponents or invented game cards are used in production. Deve
 
 The backend provides an Express/Socket.IO server at `backend/server.js`.
 
+### Persistent Player Identity
+
+Players are identified by a **server-generated session token** (`sessionId`) — a 48-hex-character cryptographically random value. The token is returned in the `createRoom` / `joinRoom` ack and stored by the frontend in `localStorage`.
+
+- `socket.id` is used only as a transport handle; it is never the permanent player identity.
+- The backend maintains a `sessions` Map: `sessionId → { roomCode, socketId }` for fast reverse-lookup.
+- All game-state lookups (`requirePlayer`, `emitGame`) use `player.socketId` for the current transport and `player.id` (= `sessionId`) for game-logic identity.
+
+### Reconnection
+
+When a player disconnects, the backend starts a **2-minute grace period** before permanently removing them. During this period:
+- `player.connected` is set to `false` and `player.socketId` is cleared.
+- Other players receive a `playerDisconnected { reconnecting: true }` event.
+- If the disconnected player holds the current turn, a 60-second auto-skip timer fires and broadcasts `turnAutoSkipped`.
+- If the player reconnects within the grace period, they emit `reconnectRoom { sessionId, roomCode }`. The server validates the token, cancels timers, restores the socket binding, and re-emits private game state.
+- Host transfer is **delayed** until the grace period expires, allowing the host to rejoin and retain their role.
+- Bankrupt players keep their session and can spectate for the remainder of the round.
+
 Room and game events:
 - `createRoom`, `joinRoom`, `leaveRoom`
+- `reconnectRoom` ← new
 - `lobbyUpdate`, `room:update`
 - `startGame`, `gameStarted`, `gameState`, `game:state`
 - `playCard`, `chooseWildColor`, `drawCard`, `cardPlayed`
 - `gameEnded`, `restartGame`, `endGame`
 - `reaction`, `reactionReceived`, `spectateRoom`
+- `playerDisconnected` (now carries `reconnecting: true`)
+- `playerReconnected` ← new
+- `playerLeft` ← emitted after grace-period expiry
+- `turnAutoSkipped` ← new
 
 Emoji reactions:
 - Exactly 9 server-validated emojis are supported.
@@ -94,7 +117,13 @@ The server uses private room state and sends each player their own hand plus opp
 
 The frontend uses `frontend/src/socket.js` for the reusable Socket.IO connection. `VITE_SOCKET_URL` defaults to `http://localhost:3001`.
 
-The React app synchronizes lobby and private game state through `lobbyUpdate`, `room:update`, `gameState`, `game:state`, `gameStarted`, `gameEnded`, and `playerDisconnected`. Client actions use acknowledged `createRoom`, `joinRoom`, `leaveRoom`, `startGame`, `playCard`, `chooseWildColor`, `drawCard`, `restartGame`, and `endGame` events. The frontend never derives authoritative card or turn state. Card flights use public `cardPlayed` events and player hand/seat container positions only; private hands are never broadcast.
+`socket.js` exports `saveSession`, `loadSession`, and `clearSession` helpers that persist `{ roomCode, sessionId }` to `localStorage`.
+
+On every socket `connect` event the React app reads `localStorage`. If a saved session is found it emits `reconnectRoom` and shows a `ReconnectingScreen`. On success the previous page (lobby or game) is restored. On failure (expired session, room gone) `clearSession()` is called and the player lands on the home screen.
+
+Disconnected opponents are shown with an amber pulsing `↻ Reconnecting…` label and a dimmed avatar. The game page never redirects on a temporary disconnect. When a reconnected player returns, a toast shows `Player X reconnected!`.
+
+The React app synchronizes lobby and private game state through `lobbyUpdate`, `room:update`, `gameState`, `game:state`, `gameStarted`, `gameEnded`, `playerDisconnected`, `playerReconnected`, and `turnAutoSkipped`. Client actions use acknowledged `createRoom`, `joinRoom`, `leaveRoom`, `reconnectRoom`, `startGame`, `playCard`, `chooseWildColor`, `drawCard`, `restartGame`, and `endGame` events. The frontend never derives authoritative card or turn state. Card flights use public `cardPlayed` events and player hand/seat container positions only; private hands are never broadcast.
 
 ## Custom Gameplay Rules
 

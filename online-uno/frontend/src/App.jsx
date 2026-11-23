@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { ArrowLeft, Copy, Crown, DoorOpen, LogOut, Plus, Play, RotateCcw, Trophy, Users, Volume2, VolumeX, Wifi, WifiOff } from 'lucide-react'
-import { socket, emitWithAck } from './socket.js'
+import { ArrowLeft, Copy, Crown, DoorOpen, LogOut, Plus, Play, RotateCcw, Trophy, Users, Volume2, VolumeX, Wifi, WifiOff, RefreshCw } from 'lucide-react'
+import { socket, emitWithAck, saveSession, loadSession, clearSession } from './socket.js'
 import './App.css'
 
 const colorNames = { red: 'Red', blue: 'Blue', green: 'Green', yellow: 'Yellow', wild: 'Wild' }
@@ -8,9 +8,9 @@ const REACTION_EMOJIS = ['😂', '😭', '🔥', '😎', '👏', '😡', '🤯',
 
 function UnoLogo({ large = false }) { return <div className={`uno-logo ${large ? 'uno-logo-large' : ''}`} aria-label="UNO"><span>UNO</span></div> }
 
-function Avatar({ name = 'You', size = 'md', status, reaction }) {
+function Avatar({ name = 'You', size = 'md', status, reaction, disconnected }) {
   const initials = name.trim().split(/\s+/).map((word) => word[0]).join('').slice(0, 2).toUpperCase() || 'Y'
-  return <div className={`avatar avatar-${size}`} aria-label={`${name} avatar`}><span>{initials}</span>{status && <i className="avatar-status" />}{reaction && <b key={reaction.reactionId} className="avatar-reaction" aria-label={`Reaction ${reaction.emoji}`}>{reaction.emoji}</b>}</div>
+  return <div className={`avatar avatar-${size} ${disconnected ? 'avatar-disconnected' : ''}`} aria-label={`${name} avatar`}><span>{initials}</span>{status && <i className="avatar-status" />}{reaction && <b key={reaction.reactionId} className="avatar-reaction" aria-label={`Reaction ${reaction.emoji}`}>{reaction.emoji}</b>}{disconnected && <span className="avatar-reconnecting-badge" title="Reconnecting…">↻</span>}</div>
 }
 
 export function GameCard({ value, color, size = 'md', onClick, disabled = false, playable = false }) {
@@ -31,8 +31,27 @@ function Toast({ message, type = 'error', onClose }) {
   return <div className={`game-toast toast-${type}`} role="alert"><span>{message}</span><button type="button" onClick={onClose} aria-label="Dismiss notification">×</button></div>
 }
 
+/** Full-screen overlay shown while auto-reconnect is in progress */
+function ReconnectingScreen({ onCancel }) {
+  return (
+    <main className="reconnecting-page" aria-live="polite">
+      <div className="reconnecting-panel">
+        <UnoLogo />
+        <div className="reconnecting-spinner" aria-hidden="true">
+          <RefreshCw size={40} className="spin-icon" />
+        </div>
+        <h1>Reconnecting…</h1>
+        <p>Restoring your previous game session. Please wait.</p>
+        <button type="button" className="button button-secondary" onClick={onCancel}>
+          Cancel and go home
+        </button>
+      </div>
+    </main>
+  )
+}
+
 function HomePage({ name, setName, onCreate, onJoin, connected, busy }) {
-  return <main className="home-page"><header className="home-header"><UnoLogo /><ConnectionBadge connected={connected} /></header><section className="home-main"><div className="home-art" aria-hidden="true"><div className="art-card art-red"><span>7</span></div><div className="art-card art-blue"><span>↻</span></div><div className="art-card art-yellow"><span>+2</span></div></div><div className="welcome-panel"><p className="kicker">FRIENDS &amp; FAMILY TABLE</p><h1>Let’s play UNO</h1><p className="welcome-copy">Match cards by color or number. Be first to empty your hand.</p><label htmlFor="player-name">Player name</label><input id="player-name" className="text-input" value={name} maxLength={16} onChange={(event) => setName(event.target.value)} placeholder="What should we call you?" /><button type="button" className="button button-primary" onClick={onCreate} disabled={!name.trim() || !connected || busy}><Plus size={19} />Create private room</button><button type="button" className="button button-secondary" onClick={onJoin} disabled={!name.trim() || !connected || busy}><DoorOpen size={19} />Join room</button></div></section><footer className="home-footer"><span>2–4 players</span><i /><span>Private rooms</span><i /><span>Classic rules</span></footer></main>
+  return <main className="home-page"><header className="home-header"><UnoLogo /><ConnectionBadge connected={connected} /></header><section className="home-main"><div className="home-art" aria-hidden="true"><div className="art-card art-red"><span>7</span></div><div className="art-card art-blue"><span>↻</span></div><div className="art-card art-yellow"><span>+2</span></div></div><div className="welcome-panel"><p className="kicker">FRIENDS &amp; FAMILY TABLE</p><h1>Let's play UNO</h1><p className="welcome-copy">Match cards by color or number. Be first to empty your hand.</p><label htmlFor="player-name">Player name</label><input id="player-name" className="text-input" value={name} maxLength={16} onChange={(event) => setName(event.target.value)} placeholder="What should we call you?" /><button type="button" className="button button-primary" onClick={onCreate} disabled={!name.trim() || !connected || busy}><Plus size={19} />Create private room</button><button type="button" className="button button-secondary" onClick={onJoin} disabled={!name.trim() || !connected || busy}><DoorOpen size={19} />Join room</button></div></section><footer className="home-footer"><span>2–4 players</span><i /><span>Private rooms</span><i /><span>Classic rules</span></footer></main>
 }
 
 function JoinPage({ code, setCode, onBack, onJoin, busy }) {
@@ -49,12 +68,13 @@ function LobbyPage({ room, playerId, onStart, onLeave, busy }) {
     try { await navigator.clipboard.writeText(room.code); setCopied(true); setTimeout(() => setCopied(false), 1500) } catch { setCopied(false) }
   }
   const slots = [...players, ...Array(Math.max(0, 4 - players.length)).fill(null)]
-  return <main className="lobby-page"><header className="utility-header"><UnoLogo /><IconButton label="Leave lobby" onClick={onLeave}><LogOut /></IconButton></header><section className="lobby-shell"><div className="lobby-title"><div><p className="kicker">PRIVATE ROOM</p><h1>Game lobby</h1></div><button type="button" className="room-code-box" onClick={copyInvitation}><span>ROOM CODE</span><strong>{room?.code || 'WAITING'}</strong><Copy size={18} /><em>{copied ? 'Copied' : 'Copy'}</em></button></div><div className="player-slots">{slots.map((player, index) => <article className={`player-slot ${player ? 'filled' : ''}`} key={player?.id || index}>{player ? <><Avatar name={player.name} size="lg" status={player.connected !== false} /><div className="slot-name"><h2>{player.name}</h2>{player.isHost && <span className="host-tag"><Crown size={12} />Host</span>}</div><span className="connection-status"><i />{player.connected === false ? 'Disconnected' : 'Connected'}</span></> : <><div className="add-slot"><Plus /></div><div className="slot-name"><h2>Open seat</h2><span className="waiting-tag">Waiting for player</span></div></>}</article>)}</div><div className="lobby-footer"><div className="player-count"><Users size={18} /><strong>{players.length}</strong><span>of 4 players</span></div><div className="waiting"><i />{players.length < 2 ? 'Waiting for players' : 'Ready to play'}</div>{isHost ? <button type="button" className="button button-primary start-button" onClick={onStart} disabled={busy || players.length < 2}><Play size={19} fill="currentColor" />Start game</button> : <button type="button" className="button button-secondary start-button" disabled>Waiting for host</button>}</div></section></main>
+  return <main className="lobby-page"><header className="utility-header"><UnoLogo /><IconButton label="Leave lobby" onClick={onLeave}><LogOut /></IconButton></header><section className="lobby-shell"><div className="lobby-title"><div><p className="kicker">PRIVATE ROOM</p><h1>Game lobby</h1></div><button type="button" className="room-code-box" onClick={copyInvitation}><span>ROOM CODE</span><strong>{room?.code || 'WAITING'}</strong><Copy size={18} /><em>{copied ? 'Copied' : 'Copy'}</em></button></div><div className="player-slots">{slots.map((player, index) => <article className={`player-slot ${player ? 'filled' : ''}`} key={player?.id || index}>{player ? <><Avatar name={player.name} size="lg" status={player.connected !== false} disconnected={player.connected === false} /><div className="slot-name"><h2>{player.name}</h2>{player.isHost && <span className="host-tag"><Crown size={12} />Host</span>}{player.connected === false && <span className="reconnecting-tag">↻ Reconnecting…</span>}</div><span className="connection-status"><i />{player.connected === false ? 'Reconnecting…' : 'Connected'}</span></> : <><div className="add-slot"><Plus /></div><div className="slot-name"><h2>Open seat</h2><span className="waiting-tag">Waiting for player</span></div></>}</article>)}</div><div className="lobby-footer"><div className="player-count"><Users size={18} /><strong>{players.length}</strong><span>of 4 players</span></div><div className="waiting"><i />{players.length < 2 ? 'Waiting for players' : 'Ready to play'}</div>{isHost ? <button type="button" className="button button-primary start-button" onClick={onStart} disabled={busy || players.length < 2}><Play size={19} fill="currentColor" />Start game</button> : <button type="button" className="button button-secondary start-button" disabled>Waiting for host</button>}</div></section></main>
 }
 
 function OpponentSeat({ side, player, active, seatRef, skipped, reaction }) {
   if (!player) return <div className={`opponent-seat opponent-${side} empty-seat`}><div className="seat-dots">···</div></div>
-  return <div ref={seatRef} className={`opponent-seat opponent-${side} ${active ? 'active-opponent' : ''} ${skipped ? 'skipped-opponent' : ''}`}><div className="opponent-avatar"><Avatar name={player.name} size="md" status={player.connected !== false} reaction={reaction} /><span>{player.cardCount}</span></div><div><strong>{player.name}</strong><small>{player.cardCount} cards</small>{active && <b className="active-seat-label">ACTIVE TURN</b>}{skipped && <b className="skipped-seat-label">SKIPPED</b>}</div></div>
+  const isDisconnected = player.connected === false
+  return <div ref={seatRef} className={`opponent-seat opponent-${side} ${active ? 'active-opponent' : ''} ${skipped ? 'skipped-opponent' : ''} ${isDisconnected ? 'disconnected-opponent' : ''}`}><div className="opponent-avatar"><Avatar name={player.name} size="md" status={!isDisconnected} reaction={reaction} disconnected={isDisconnected} /><span>{player.cardCount}</span></div><div><strong>{player.name}</strong><small>{isDisconnected ? <span className="reconnecting-label">↻ Reconnecting…</span> : `${player.cardCount} cards`}</small>{active && !isDisconnected && <b className="active-seat-label">ACTIVE TURN</b>}{active && isDisconnected && <b className="active-seat-label disconnected-turn-label">TURN PENDING</b>}{skipped && <b className="skipped-seat-label">SKIPPED</b>}</div></div>
 }
 
 function GamePage({ name, playerId, game, onLeave, onDraw, onPlay, busy, drawnCard, cardFlight, reactions, onReact }) {
@@ -139,10 +159,12 @@ function App() {
   const [toast, setToast] = useState(null)
   const [drawnCard, setDrawnCard] = useState(null)
   const [cardFlight, setCardFlight] = useState(null)
+  const [reconnecting, setReconnecting] = useState(false)
   const seenCardActions = useRef(new Set())
   const seenReactionIds = useRef(new Set())
   const reactionTimers = useRef(new Map())
   const [reactions, setReactions] = useState({})
+  const reconnectAttempted = useRef(false)
 
   function showError(payload) { setToast({ type: 'error', message: payload?.message || 'The server could not complete that action' }) }
 
@@ -152,12 +174,75 @@ function App() {
     return () => window.clearTimeout(timer)
   }, [toast])
 
+  // ---------------------------------------------------------------------------
+  // Auto-reconnect helper — called on every (re)connect event
+  // ---------------------------------------------------------------------------
+  async function attemptReconnect() {
+    const session = loadSession()
+    if (!session) return false
+
+    setReconnecting(true)
+    const response = await emitWithAck('reconnectRoom', {
+      sessionId: session.sessionId,
+      roomCode: session.roomCode,
+    })
+
+    if (!response?.ok) {
+      // Session expired or room gone — clear saved data
+      clearSession()
+      setReconnecting(false)
+      return false
+    }
+
+    // Restore state from server response
+    setPlayerId(response.playerId)
+    setRoom(response.lobby)
+    setJoinCode(response.roomCode)
+
+    if (response.state) {
+      setGame(response.state)
+    }
+
+    if (response.gameStatus === 'playing' && response.state) {
+      setPage('game')
+    } else {
+      setPage('lobby')
+    }
+
+    setReconnecting(false)
+    return true
+  }
+
   useEffect(() => {
     const reactionTimerMap = reactionTimers.current
-    function onConnect() { setConnected(true); setToast(null) }
-    function onDisconnect(reason) { setConnected(false); setToast({ type: 'error', message: reason === 'io server disconnect' ? 'Disconnected by server' : 'Server disconnected' }) }
+
+    async function onConnect() {
+      setConnected(true)
+      setToast(null)
+
+      // Only attempt auto-reconnect once per mount to avoid re-triggering on
+      // every socket reconnect cycle (the server restore handles the rest).
+      if (!reconnectAttempted.current) {
+        reconnectAttempted.current = true
+        await attemptReconnect()
+      }
+    }
+
+    function onDisconnect(reason) {
+      setConnected(false)
+      // Do NOT redirect to home — the socket will reconnect automatically.
+      // Show a subtle toast but keep whatever page the user is on.
+      setToast({
+        type: 'error',
+        message: reason === 'io server disconnect'
+          ? 'Disconnected by server'
+          : 'Connection lost — reconnecting…',
+      })
+    }
+
     function onLobby(payload) { setRoom(payload) }
     function onGame(payload) { if (payload) { setGame(payload); setPage('game') } }
+
     function onReaction(payload) {
       if (!payload?.reactionId || !payload?.playerId || !REACTION_EMOJIS.includes(payload.emoji)) return
       if (seenReactionIds.current.has(payload.reactionId)) return
@@ -177,6 +262,7 @@ function App() {
       }, 2000)
       reactionTimers.current.set(payload.playerId, timer)
     }
+
     function onCardPlayed(payload) {
       if (!payload?.actionId || seenCardActions.current.has(payload.actionId)) return
       seenCardActions.current.add(payload.actionId)
@@ -189,10 +275,25 @@ function App() {
       if (payload.card?.value === 'draw3') setToast({ type: 'success', message: '+3 PENALTY' })
       if (payload.card?.value === 'draw4') setToast({ type: 'success', message: '+4 PENALTY' })
     }
+
     function onCardDrawn() {}
     function onGameStarted() { setWinner(null); setPage('game') }
     function onGameEnded(payload) { setWinner(payload?.winner || null); if (payload?.state) setGame(payload.state); setPage('gameover') }
-    function onPlayerDisconnected() { setToast({ type: 'error', message: 'A player disconnected from the room' }) }
+
+    function onPlayerDisconnected(payload) {
+      // Show indicator but do NOT redirect to home
+      setToast({ type: 'error', message: `${payload?.name || 'A player'} disconnected — waiting for reconnect…` })
+      // Update room player list to reflect disconnected status (server will also emit lobbyUpdate)
+    }
+
+    function onPlayerReconnected(payload) {
+      setToast({ type: 'success', message: `${payload?.name || 'A player'} reconnected!` })
+    }
+
+    function onTurnAutoSkipped(payload) {
+      setToast({ type: 'error', message: `${payload?.name || 'Disconnected player'}'s turn was skipped` })
+    }
+
     function onError(payload) { showError(payload) }
 
     socket.on('connect', onConnect)
@@ -209,21 +310,56 @@ function App() {
     socket.on('gameEnded', onGameEnded)
     socket.on('gameRestarted', onLobby)
     socket.on('playerDisconnected', onPlayerDisconnected)
+    socket.on('playerReconnected', onPlayerReconnected)
+    socket.on('turnAutoSkipped', onTurnAutoSkipped)
     socket.on('error', onError)
+
+    // If the socket is already connected when the component mounts (e.g. hot reload),
+    // trigger reconnect immediately.
+    if (socket.connected && !reconnectAttempted.current) {
+      reconnectAttempted.current = true
+      attemptReconnect()
+    }
 
     return () => {
       reactionTimerMap.forEach((timer) => window.clearTimeout(timer))
       reactionTimerMap.clear()
-      socket.off('connect', onConnect); socket.off('disconnect', onDisconnect); socket.off('lobbyUpdate', onLobby); socket.off('room:update', onLobby); socket.off('gameState', onGame); socket.off('game:state', onGame); socket.off('cardPlayed', onCardPlayed); socket.off('reaction', onReaction); socket.off('reactionReceived', onReaction); socket.off('cardDrawn', onCardDrawn); socket.off('gameStarted', onGameStarted); socket.off('gameEnded', onGameEnded); socket.off('gameRestarted', onLobby); socket.off('playerDisconnected', onPlayerDisconnected); socket.off('error', onError)
+      socket.off('connect', onConnect)
+      socket.off('disconnect', onDisconnect)
+      socket.off('lobbyUpdate', onLobby)
+      socket.off('room:update', onLobby)
+      socket.off('gameState', onGame)
+      socket.off('game:state', onGame)
+      socket.off('cardPlayed', onCardPlayed)
+      socket.off('reaction', onReaction)
+      socket.off('reactionReceived', onReaction)
+      socket.off('cardDrawn', onCardDrawn)
+      socket.off('gameStarted', onGameStarted)
+      socket.off('gameEnded', onGameEnded)
+      socket.off('gameRestarted', onLobby)
+      socket.off('playerDisconnected', onPlayerDisconnected)
+      socket.off('playerReconnected', onPlayerReconnected)
+      socket.off('turnAutoSkipped', onTurnAutoSkipped)
+      socket.off('error', onError)
     }
   }, [])
+
+  // ---------------------------------------------------------------------------
+  // Room actions
+  // ---------------------------------------------------------------------------
 
   async function createRoom() {
     setBusy(true)
     const response = await emitWithAck('createRoom', { name })
     setBusy(false)
     if (!response?.ok) return showError(response)
-    setPlayerId(response.playerId); setRoom(response.lobby); setJoinCode(response.roomCode); setPage('lobby')
+    const sid = response.sessionId || response.playerId
+    setPlayerId(sid)
+    setRoom(response.lobby)
+    setJoinCode(response.roomCode)
+    setPage('lobby')
+    // Persist session for reconnection
+    saveSession(response.roomCode, sid)
   }
 
   async function joinRoom() {
@@ -231,11 +367,18 @@ function App() {
     const response = await emitWithAck('joinRoom', { code: joinCode, name })
     setBusy(false)
     if (!response?.ok) return showError(response)
-    setPlayerId(response.playerId); setRoom(response.lobby); setPage('lobby')
+    const sid = response.sessionId || response.playerId
+    setPlayerId(sid)
+    setRoom(response.lobby)
+    setPage('lobby')
+    // Persist session for reconnection
+    saveSession(response.roomCode, sid)
   }
 
   async function leaveRoom() {
     await emitWithAck('leaveRoom', { roomCode: room?.code })
+    // Explicit leave — clear the saved session
+    clearSession()
     setRoom(null); setGame(null); setWinner(null); setPage('home')
   }
 
@@ -290,7 +433,26 @@ function App() {
     else { setWinner(null); setGame(null); setRoom(response.lobby); setPage('lobby') }
   }
 
-  return <><Toast message={toast?.message} type={toast?.type} onClose={() => setToast(null)} />{page === 'home' && <HomePage name={name} setName={setName} onCreate={createRoom} onJoin={() => setPage('join')} connected={connected} busy={busy} />}{page === 'join' && <JoinPage code={joinCode} setCode={setJoinCode} onBack={() => setPage('home')} onJoin={joinRoom} busy={busy} />}{page === 'lobby' && <LobbyPage room={room} playerId={playerId} onStart={startGame} onLeave={leaveRoom} busy={busy} />}{page === 'game' && <GamePage name={name} playerId={playerId} game={game} onLeave={leaveRoom} onDraw={drawCard} onPlay={playCard} busy={busy} drawnCard={drawnCard} cardFlight={cardFlight} reactions={reactions} onReact={sendReaction} />}{page === 'gameover' && <GameOverPage winner={winner} onReplay={restartGame} onLobby={returnToLobby} isHost={room?.hostId === playerId} />}</>
+  function cancelReconnect() {
+    clearSession()
+    setReconnecting(false)
+    setPage('home')
+  }
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
+
+  if (reconnecting) return <ReconnectingScreen onCancel={cancelReconnect} />
+
+  return <>
+    <Toast message={toast?.message} type={toast?.type} onClose={() => setToast(null)} />
+    {page === 'home' && <HomePage name={name} setName={setName} onCreate={createRoom} onJoin={() => setPage('join')} connected={connected} busy={busy} />}
+    {page === 'join' && <JoinPage code={joinCode} setCode={setJoinCode} onBack={() => setPage('home')} onJoin={joinRoom} busy={busy} />}
+    {page === 'lobby' && <LobbyPage room={room} playerId={playerId} onStart={startGame} onLeave={leaveRoom} busy={busy} />}
+    {page === 'game' && <GamePage name={name} playerId={playerId} game={game} onLeave={leaveRoom} onDraw={drawCard} onPlay={playCard} busy={busy} drawnCard={drawnCard} cardFlight={cardFlight} reactions={reactions} onReact={sendReaction} />}
+    {page === 'gameover' && <GameOverPage winner={winner} onReplay={restartGame} onLobby={returnToLobby} isHost={room?.hostId === playerId} />}
+  </>
 }
 
 export default App
