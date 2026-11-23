@@ -6,6 +6,7 @@
 - [x] Room management
 - [x] Multiplayer integration
 - [ ] Responsive layout testing
+- [x] Environment configuration
 - [ ] Deployment
 
 ## Current Task
@@ -66,6 +67,7 @@ No existing frontend Socket.IO implementation or backend event contract was foun
 - Frontend production build passes
 - 33 backend engine, penalty-stacking, optional-draw, reaction, and Socket.IO tests pass
 - Optional voluntary draw now ends the turn and remains blocked during pending penalties
+- Added frontend and backend `.env`/`.env.example` files; backend loads dotenv
 - Added per-turn draw guards and 20-card bankruptcy handling
 - Browser-level multi-tab manual testing remains the final deployment verification
 - Emoji reactions are supported for active players, bankrupt players, and spectators
